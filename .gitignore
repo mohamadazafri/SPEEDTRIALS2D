@@ -1,0 +1,14 @@
+# Unity binaries (large files, shouldn't be in git)
+*.so
+*.x86_64
+*.debug
+SpeedTrials2D-linux_Data/
+
+# Python virtual environment
+.venv/
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
+EOF
