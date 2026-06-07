@@ -19,13 +19,17 @@ CONTROL_PORT = 8081
 
 # Shared Resources with Mutex Lock for Concurrency
 shared_data = {
-    'latest_front_frame': None,
-    'latest_back_frame': None,
-    'steering_input' : 0.0,
-    'acceleration_input' : 0.0
+    'latest_front_frame':    None,
+    'latest_back_frame':     None,
+    'steering_input':        0.0,
+    'acceleration_input':    0.0,
+    'trailing_car_detected': False
 }
 data_lock = threading.Lock()
 is_running = True
+
+# Global Tracking Variables
+has_saved_debug   = False
 
 # ---------------------------------------------------------
 # Real-Time Scheduling Framework (Do not change this in your code)
@@ -205,24 +209,94 @@ def processing_task():
     #Remember to use the shared_data to get the latest frame
     with data_lock:
         front_frame = shared_data['latest_front_frame']
-    
-    if front_frame is not None:
-        # write your processing here
-        pass
+
+    if front_frame is None:
+        return
+
+    hsv            = cv2.cvtColor(front_frame, cv2.COLOR_BGR2HSV)
+    frame_center_x = front_frame.shape[1] // 2
+
+    target_steering     = 0.0
+    target_acceleration = 1.0
+
+    # AZAF: Dual HSV range for red (covers both ends of the hue spectrum)
+    lower_red1 = np.array([0,   100, 180])
+    upper_red1 = np.array([8,   255, 255])
+    lower_red2 = np.array([172, 100, 180])
+    upper_red2 = np.array([179, 255, 255])
+    mask_red   = cv2.bitwise_or(
+        cv2.inRange(hsv, lower_red1, upper_red1),
+        cv2.inRange(hsv, lower_red2, upper_red2)
+    )
+
+    # Green thresholds (unchanged, base values)
+    lower_green = np.array([50, 80, 180])
+    upper_green = np.array([75, 255, 255])
+    mask_green  = cv2.inRange(hsv, lower_green, upper_green)
+
+    if not has_saved_debug:
+        cv2.imwrite("debug_1_raw_frame.png",  front_frame)
+        cv2.imwrite("debug_2_red_mask.png",   mask_red)
+        cv2.imwrite("debug_3_green_mask.png", mask_green)
+        print("Saved mask snapshots.")
+        has_saved_debug = True
+
+    contours_red,   _ = cv2.findContours(mask_red,   cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    contours_green, _ = cv2.findContours(mask_green, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+    # AZAF: Collect all red contours large enough, sort by closest to car
+    danger_reds = []
+    for c in contours_red:
+        area = cv2.contourArea(c)
+        if area > 200:  # lowered from 400 = detect earlier
+            x, y, w, h = cv2.boundingRect(c)
+            danger_reds.append((area, x, y, w, h, y + h))
+
+    if danger_reds:
+        # Sort by token_bottom descending = closest token to car is first
+        danger_reds.sort(key=lambda t: t[5], reverse=True)
+        area, x, y, w, h, token_bottom = danger_reds[0]
+        red_center_x = x + w // 2
+
+        # Wider danger zone: 130px instead of 100px
+        if abs(red_center_x - frame_center_x) < 130:
+            target_steering   = -1.0 if red_center_x >= frame_center_x else 1.0
+            with data_lock:
+                shared_data['steering_input']     = target_steering
+                shared_data['acceleration_input'] = target_acceleration
+            return
+
+    # Green chasing (base logic, unchanged)
+    if contours_green:
+        largest_green = max(contours_green, key=cv2.contourArea)
+        if cv2.contourArea(largest_green) > 300:
+            x, y, w, h     = cv2.boundingRect(largest_green)
+            green_center_x = x + w // 2
+
+            if green_center_x > frame_center_x + 30:
+                target_steering   = 1.0
+            elif green_center_x < frame_center_x - 30:
+                target_steering   = -1.0
+
+            if target_steering != 0.0:
+                with data_lock:
+                    shared_data['steering_input']     = target_steering
+                    shared_data['acceleration_input'] = target_acceleration
+                return
+
+    with data_lock:
+        shared_data['steering_input']     = 0.0
+        shared_data['acceleration_input'] = target_acceleration
+
 
 def send_controls_task():
     #This is where you send the control commands to the car using the control_conn
     global control_conn
     if control_conn is None:
         return
-    
-    #these are the variables used to control the car
-    #steering_input: -1.0 to 1.0 (left to right)
-    #acceleration_input: -1.0 to 1.0 (reverse to forward)
-    #this example always accelerate forward
-    steering_input = 0.0
-    acceleration_input = 1.0
-
+    with data_lock:
+        steering_input     = shared_data['steering_input']
+        acceleration_input = shared_data['acceleration_input']
     try:
         # Pack and send the control command
         data = struct.pack('ff', steering_input, acceleration_input)
