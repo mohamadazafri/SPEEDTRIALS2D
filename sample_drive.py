@@ -19,10 +19,11 @@ CONTROL_PORT = 8081
 
 # Shared Resources with Mutex Lock for Concurrency
 shared_data = {
-    'latest_front_frame': None,
-    'latest_back_frame': None,
-    'steering_input' : 0.0,
-    'acceleration_input' : 0.0
+    'latest_front_frame':    None,
+    'latest_back_frame':     None,
+    'steering_input':        0.0,
+    'acceleration_input':    0.0,
+    'trailing_car_detected': False
 }
 data_lock = threading.Lock()
 is_running = True
