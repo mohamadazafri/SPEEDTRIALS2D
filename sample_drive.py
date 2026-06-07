@@ -27,6 +27,10 @@ shared_data = {
 data_lock = threading.Lock()
 is_running = True
 
+# Global Tracking Variables for the Logic
+steering_cooldown = 0   # Counts down how long a "tap" should last
+has_saved_debug = False # Flag to save debug images only once
+
 # ---------------------------------------------------------
 # Real-Time Scheduling Framework (Do not change this in your code)
 # ---------------------------------------------------------
@@ -131,11 +135,10 @@ def setup_control_server():
             continue
 
 # ---------------------------------------------------------
-# Task Implementations (This is where you write your tasks)
+# Task Implementations
 # ---------------------------------------------------------
 
 def read_single_camera(sock, window_name, data_key):
-    #This function reads the latest frame from the camera socket and stores it in the shared data
     if sock is None:
         return
         
@@ -184,10 +187,10 @@ def read_single_camera(sock, window_name, data_key):
                 with data_lock:
                     shared_data[data_key] = frame
                 
-                # You may disable this if you don't need to display the frames / This could effect the fps
-                frame_resized = cv2.resize(frame, (640, 480))
-                cv2.imshow(window_name, frame_resized)
-                cv2.waitKey(1)
+                # Resizing and displaying windows is commented out to preserve FPS and avoid thread locks
+                # frame_resized = cv2.resize(frame, (640, 480))
+                # cv2.imshow(window_name, frame_resized)
+                # cv2.waitKey(1)
                 
     except Exception as e:
         pass
@@ -199,38 +202,104 @@ def read_back_camera_task():
     read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame')
 
 def processing_task():
-    #This is where you write your image processing code to decide how to control the car
-    #You can use libraries like OpenCV to process the image
-    #There is no limtation to the complexity of the processing task, you can use any libraries you want
-    #Remember to use the shared_data to get the latest frame
+    global shared_data, steering_cooldown, has_saved_debug
+    
+    if steering_cooldown > 0:
+        steering_cooldown -= 1
+        if steering_cooldown == 0:
+            with data_lock:
+                shared_data['steering_input'] = 0.0
+        return
+
     with data_lock:
         front_frame = shared_data['latest_front_frame']
     
     if front_frame is not None:
-        # write your processing here
-        pass
+        hsv = cv2.cvtColor(front_frame, cv2.COLOR_BGR2HSV)
+        frame_center_x = front_frame.shape[1] // 2
+        
+        target_steering = 0.0
+        target_acceleration = 1.0
+        
+        lower_red1 = np.array([0,   100, 180])
+        upper_red1 = np.array([8,   255, 255])
+        lower_red2 = np.array([172, 100, 180])
+        upper_red2 = np.array([179, 255, 255])
+        lower_green = np.array([50, 80, 180])
+        upper_green = np.array([75, 255, 255])
+        
+        mask_red1 = cv2.inRange(hsv, lower_red1, upper_red1)
+        mask_red2 = cv2.inRange(hsv, lower_red2, upper_red2)
+        mask_red = cv2.bitwise_or(mask_red1, mask_red2)
+        mask_green = cv2.inRange(hsv, lower_green, upper_green)
+        
+        if not has_saved_debug:
+            cv2.imwrite("debug_1_raw_frame.png", front_frame)
+            cv2.imwrite("debug_2_red_mask.png", mask_red)
+            cv2.imwrite("debug_3_green_mask.png", mask_green)
+            print("[DEBUG] Saved snapshots to your project folder!")
+            has_saved_debug = True
+        
+        contours_red, _ = cv2.findContours(mask_red, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        contours_green, _ = cv2.findContours(mask_green, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if contours_red:
+            largest_red = max(contours_red, key=cv2.contourArea)
+            if cv2.contourArea(largest_red) > 400:
+                x, y, w, h = cv2.boundingRect(largest_red)
+                red_center_x = x + w // 2
+                
+                if abs(red_center_x - frame_center_x) < 100:
+                    if red_center_x > frame_center_x:
+                        target_steering = -1.0
+                    else:
+                        target_steering = 1.0
+                    
+                    steering_cooldown = 15
+                    
+                    with data_lock:
+                        shared_data['steering_input'] = target_steering
+                        shared_data['acceleration_input'] = target_acceleration
+                    return
+
+        if contours_green:
+            largest_green = max(contours_green, key=cv2.contourArea)
+            if cv2.contourArea(largest_green) > 300:
+                x, y, w, h = cv2.boundingRect(largest_green)
+                green_center_x = x + w // 2
+                
+                if green_center_x > frame_center_x + 30:
+                    target_steering = 1.0
+                    steering_cooldown = 10
+                elif green_center_x < frame_center_x - 30:
+                    target_steering = -1.0
+                    steering_cooldown = 10
+                    
+                if target_steering != 0.0:
+                    with data_lock:
+                        shared_data['steering_input'] = target_steering
+                        shared_data['acceleration_input'] = target_acceleration
+                    return
+
+        with data_lock:
+            shared_data['steering_input'] = 0.0
+            shared_data['acceleration_input'] = target_acceleration
 
 def send_controls_task():
-    #This is where you send the control commands to the car using the control_conn
     global control_conn
     if control_conn is None:
         return
     
-    #these are the variables used to control the car
-    #steering_input: -1.0 to 1.0 (left to right)
-    #acceleration_input: -1.0 to 1.0 (reverse to forward)
-    #this example always accelerate forward
-    steering_input = 0.0
-    acceleration_input = 1.0
+    # Safely pull the calculated variables calculated from your vision logic out of shared memory
+    with data_lock:
+        steering_input = shared_data['steering_input']
+        acceleration_input = shared_data['acceleration_input']
 
     try:
-        # Pack and send the control command
         data = struct.pack('ff', steering_input, acceleration_input)
         control_conn.sendall(data)
     except Exception as e:
-        print(f"Control send error: {e}")
         control_conn = None
-
 
 # ---------------------------------------------------------
 # Main (Scheduler Initialization)
@@ -244,10 +313,6 @@ if __name__ == '__main__':
     
     print("\n--- Starting Real-Time Tasks (awaiting connections dynamically) ---\n")
     
-    # This is where you define tasks with explicit Scheduling parameters (Concurrency, Priority, Period)
-    # Period refers to the period of execution of the task in seconds
-    # Priority refers to the priority of the task, higher priority means higher priority
-    # Concurrency refers to the number of instances of the task that can run at the same time
     t_front_camera = RTTask("ReadFrontCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_front_camera_task)
     t_back_camera = RTTask("ReadBackCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_back_camera_task)
     t_processing = RTTask("Processing", period=0.005, priority=TaskPriority.MEDIUM, execute_func=processing_task)
@@ -260,20 +325,17 @@ if __name__ == '__main__':
     t_controls.start()
     
     try:
-        # You need this to keep the main thread alive, otherwise the program will exit immediately
         while is_running:
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nKeyboard Interrupt detected. Stopping system...")
         is_running = False
 
-    # This is to make sure that the tasks are terminated cleanly
     t_front_camera.join()
     t_back_camera.join()
     t_processing.join()
     t_controls.join()
     
-    # This is to close all the connections
     if front_camera_sock:
         front_camera_sock.close()
     if back_camera_sock:
