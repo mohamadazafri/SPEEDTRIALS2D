@@ -234,6 +234,22 @@ def processing_task():
         mask_green = cv2.inRange(hsv, lower_green, upper_green)
         mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow) # Yellow color mask
         
+        # ==================================================================
+        # REGION OF INTEREST (ROI) FILTERING
+        # ==================================================================
+        height, width = mask_red.shape[:2]
+        
+        # 1. Clear top 30% of the screen (eliminates UI background text noise)
+        mask_red[0:int(height * 0.30), :] = 0
+        mask_green[0:int(height * 0.30), :] = 0
+        mask_yellow[0:int(height * 0.30), :] = 0
+        
+        # 2. Clear bottom 15% of the screen (eliminates reflection from your own chassis)
+        mask_red[int(height * 0.85):, :] = 0
+        mask_green[int(height * 0.85):, :] = 0
+        mask_yellow[int(height * 0.85):, :] = 0
+        # ==================================================================
+        
         if not has_saved_debug:
             cv2.imwrite("debug_1_raw_frame.png", front_frame)
             cv2.imwrite("debug_2_red_mask.png", mask_red)
