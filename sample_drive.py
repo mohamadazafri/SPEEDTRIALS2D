@@ -188,11 +188,6 @@ def read_single_camera(sock, window_name, data_key):
                 with data_lock:
                     shared_data[data_key] = frame
                 
-                # Resizing and displaying windows is commented out to preserve FPS and avoid thread locks
-                # frame_resized = cv2.resize(frame, (640, 480))
-                # cv2.imshow(window_name, frame_resized)
-                # cv2.waitKey(1)
-                
     except Exception as e:
         pass
 
@@ -229,21 +224,29 @@ def processing_task():
         lower_green = np.array([50, 80, 180])
         upper_green = np.array([75, 255, 255])
         
+        # Yellow token HSV threshold parameters (Hue 20-35 range)
+        lower_yellow = np.array([20, 100, 180])
+        upper_yellow = np.array([35, 255, 255])
+        
         mask_red1 = cv2.inRange(hsv, lower_red1, upper_red1)
         mask_red2 = cv2.inRange(hsv, lower_red2, upper_red2)
         mask_red = cv2.bitwise_or(mask_red1, mask_red2)
         mask_green = cv2.inRange(hsv, lower_green, upper_green)
+        mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow) # Yellow color mask
         
         if not has_saved_debug:
             cv2.imwrite("debug_1_raw_frame.png", front_frame)
             cv2.imwrite("debug_2_red_mask.png", mask_red)
             cv2.imwrite("debug_3_green_mask.png", mask_green)
+            cv2.imwrite("debug_4_yellow_mask.png", mask_yellow) # Diagnostic yellow channel save
             print("[DEBUG] Saved snapshots to your project folder!")
             has_saved_debug = True
         
         contours_red, _ = cv2.findContours(mask_red, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         contours_green, _ = cv2.findContours(mask_green, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        contours_yellow, _ = cv2.findContours(mask_yellow, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE) # Yellow contours extraction
         
+        # PRIORITY 1: Dodge Red Tokens
         if contours_red:
             largest_red = max(contours_red, key=cv2.contourArea)
             if cv2.contourArea(largest_red) > 400:
@@ -263,6 +266,30 @@ def processing_task():
                         shared_data['acceleration_input'] = target_acceleration
                     return
 
+        # PRIORITY 2 - Dodge Yellow Tokens (Avoids 5-second dynamic corruption states)
+        danger_yellows = []
+        for c in contours_yellow:
+            area = cv2.contourArea(c)
+            if area > 200: # Filter out minor background image artifacts
+                x, y, w, h = cv2.boundingRect(c)
+                danger_yellows.append((area, x, y, w, h, y + h)) # Track bottom coordinates for proximity sorting
+
+        if danger_yellows:
+            # Sort by token_bottom descending = closest yellow token to the car is handled first
+            danger_yellows.sort(key=lambda t: t[5], reverse=True)
+            area, x, y, w, h, token_bottom = danger_yellows[0]
+            yellow_center_x = x + w // 2
+
+            if abs(yellow_center_x - frame_center_x) < 130: # 130px center track safety band
+                target_steering = -1.0 if yellow_center_x >= frame_center_x else 1.0
+                steering_cooldown = 8 # Fast stabilization recovery step length
+                print(f"[YELLOW] Dodging yellow token at x={yellow_center_x}, steering={target_steering}")
+                with data_lock:
+                    shared_data['steering_input'] = target_steering
+                    shared_data['acceleration_input'] = target_acceleration
+                return
+
+        # PRIORITY 3: Chase Green Tokens
         if contours_green:
             largest_green = max(contours_green, key=cv2.contourArea)
             if cv2.contourArea(largest_green) > 300:
@@ -291,7 +318,6 @@ def send_controls_task():
     if control_conn is None:
         return
     
-    # Safely pull the calculated variables calculated from your vision logic out of shared memory
     with data_lock:
         steering_input = shared_data['steering_input']
         acceleration_input = shared_data['acceleration_input']
