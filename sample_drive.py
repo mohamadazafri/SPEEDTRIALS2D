@@ -32,6 +32,35 @@ is_running = True
 steering_cooldown = 0   # Counts down how long a "tap" should last
 has_saved_debug = False # Flag to save debug images only once
 
+# ==================================================================
+# CHALLENGE 2: Chasing Car — Global Tracking Variables
+# ==================================================================
+# The chasing car appears TWICE during the game.
+# 1st appearance: player has 10 seconds to avoid it.
+# 2nd appearance: player has only 3 seconds to avoid it.
+# If it collides with the player → 50% speed loss.
+#
+# Strategy: detect motion in the back camera via frame differencing.
+#           When detected, immediately steer left to evade.
+# ==================================================================
+chasing_car_state = {
+    'prev_back_frame': None,         # Previous back frame for differencing
+    'appearances_count': 0,          # How many times the chasing car has appeared (max 2)
+    'is_chasing_active': False,      # True while a chasing car event is ongoing
+    'evasion_ticks_remaining': 0,    # Countdown ticks for the evasion manoeuvre
+    'detection_cooldown': 0,         # Cooldown after an evasion to avoid re-triggering
+    'consecutive_detections': 0,     # Consecutive frames with motion detected (debounce)
+}
+# Timing constants (1 tick = 5ms task period)
+CHASING_DEBOUNCE_FRAMES   = 3      # Only 3 consecutive detections needed (~15ms) — react FAST
+CHASING_EVASION_TICKS_1ST = 500    # 500 ticks × 5ms = 2.5s evasion steering for 1st car
+CHASING_EVASION_TICKS_2ND = 300    # 300 ticks × 5ms = 1.5s evasion steering for 2nd car
+CHASING_DETECTION_COOLDOWN = 4000  # 4000 ticks × 5ms = 20s cooldown between appearances
+CHASING_MOTION_AREA_THRESH = 500   # Min motion contour area (px²) — lowered for sensitivity
+CHASING_COLOR_AREA_THRESH  = 300   # Min color contour area (px²) for car-color detection
+CHASING_ROI_Y_START        = 0.30  # Examine bottom 70% of back frame (wider scan)
+CHASING_PIXEL_RATIO_THRESH = 0.02  # If >2% of ROI pixels show motion, car is present
+
 # ---------------------------------------------------------
 # Real-Time Scheduling Framework (Do not change this in your code)
 # ---------------------------------------------------------
@@ -197,8 +226,212 @@ def read_front_camera_task():
 def read_back_camera_task():
     read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame')
 
+
+# ==================================================================
+# CHALLENGE 2: Chasing Car — Detection Functions
+# ==================================================================
+
+def _detect_chasing_car_motion(current_frame, prev_frame):
+    """METHOD 1: Frame differencing — detect motion in the back camera.
+    Returns True if significant motion is found in the ROI."""
+    if current_frame is None or prev_frame is None:
+        return False
+    if current_frame.shape != prev_frame.shape:
+        return False
+    
+    diff = cv2.absdiff(current_frame, prev_frame)
+    gray_diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+    gray_diff = cv2.GaussianBlur(gray_diff, (5, 5), 0)
+    _, thresh = cv2.threshold(gray_diff, 20, 255, cv2.THRESH_BINARY)  # Lower threshold (was 25)
+    
+    # Full-width ROI, bottom 70% of frame
+    height, width = thresh.shape
+    roi_y = int(height * CHASING_ROI_Y_START)
+    roi = thresh[roi_y:, :]
+    
+    # Method 1a: Contour-based check
+    contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for c in contours:
+        if cv2.contourArea(c) > CHASING_MOTION_AREA_THRESH:
+            return True
+    
+    # Method 1b: Pixel ratio check — even without large contours,
+    # if many pixels are changing, something big is approaching
+    white_pixels = cv2.countNonZero(roi)
+    total_pixels = roi.shape[0] * roi.shape[1]
+    if total_pixels > 0 and (white_pixels / total_pixels) > CHASING_PIXEL_RATIO_THRESH:
+        return True
+    
+    return False
+
+
+def _detect_chasing_car_color(frame):
+    """METHOD 2: Color-based detection — look for car-colored objects.
+    
+    The chasing car is typically a distinct colored vehicle. We look for
+    dark/metallic objects AND bright-colored objects that are NOT part of
+    the normal road/sky background.
+    
+    Returns True if a car-like colored object is found in the ROI."""
+    if frame is None:
+        return False
+    
+    height, width = frame.shape[:2]
+    roi_y = int(height * CHASING_ROI_Y_START)
+    roi = frame[roi_y:, :]
+    
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    
+    # Look for dark/metallic objects (car body — low saturation, low-mid value)
+    # This catches dark gray, black, dark blue cars
+    lower_dark = np.array([0, 0, 30])
+    upper_dark = np.array([180, 80, 120])
+    mask_dark = cv2.inRange(hsv, lower_dark, upper_dark)
+    
+    # Look for bright saturated objects (red, blue, white cars)
+    # Red car (wraps around 0°)
+    lower_red1 = np.array([0, 120, 100])
+    upper_red1 = np.array([10, 255, 255])
+    lower_red2 = np.array([165, 120, 100])
+    upper_red2 = np.array([180, 255, 255])
+    mask_red = cv2.bitwise_or(
+        cv2.inRange(hsv, lower_red1, upper_red1),
+        cv2.inRange(hsv, lower_red2, upper_red2)
+    )
+    
+    # Blue car
+    lower_blue = np.array([100, 100, 80])
+    upper_blue = np.array([130, 255, 255])
+    mask_blue = cv2.inRange(hsv, lower_blue, upper_blue)
+    
+    # White/bright car
+    lower_white = np.array([0, 0, 200])
+    upper_white = np.array([180, 40, 255])
+    mask_white = cv2.inRange(hsv, lower_white, upper_white)
+    
+    # Combine all car-color masks
+    mask_combined = cv2.bitwise_or(mask_dark, mask_red)
+    mask_combined = cv2.bitwise_or(mask_combined, mask_blue)
+    mask_combined = cv2.bitwise_or(mask_combined, mask_white)
+    
+    # Morphological operations to clean up noise and merge nearby blobs
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    mask_combined = cv2.morphologyEx(mask_combined, cv2.MORPH_CLOSE, kernel)
+    mask_combined = cv2.morphologyEx(mask_combined, cv2.MORPH_OPEN, kernel)
+    
+    contours, _ = cv2.findContours(mask_combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for c in contours:
+        if cv2.contourArea(c) > CHASING_COLOR_AREA_THRESH:
+            # Additional check: the contour should be roughly in the centre
+            # (a car chasing from behind approaches from the middle)
+            x, y, w, h = cv2.boundingRect(c)
+            cx = x + w // 2
+            roi_width = roi.shape[1]
+            # Check if contour centre is within the middle 80% of frame
+            if roi_width * 0.1 < cx < roi_width * 0.9:
+                return True
+    
+    return False
+
+
+def detect_chasing_car(current_frame, prev_frame):
+    """Combined chasing car detection using multiple methods.
+    Returns True if ANY method detects a car behind us."""
+    motion_detected = _detect_chasing_car_motion(current_frame, prev_frame)
+    color_detected = _detect_chasing_car_color(current_frame)
+    
+    # Require BOTH methods to agree to avoid false positives:
+    # - Motion alone triggers on road scrolling (false positive)
+    # - Color alone triggers on static scenery (false positive)
+    # - Both together = a new colored object that's also moving = real car
+    return motion_detected and color_detected
+
 def processing_task():
-    global shared_data, steering_cooldown, has_saved_debug
+    global shared_data, steering_cooldown, has_saved_debug, chasing_car_state
+    
+    # ==================================================================
+    # CHALLENGE 2: Chasing Car — Back Camera Processing (HIGHEST PRIORITY)
+    # ==================================================================
+    # Check the back camera for an approaching chasing car.
+    # This runs before everything else because collision = 50% speed loss.
+    # ==================================================================
+    
+    # Tick down detection cooldown regardless of other state
+    if chasing_car_state['detection_cooldown'] > 0:
+        chasing_car_state['detection_cooldown'] -= 1
+    
+    # If currently evading, count down and keep steering
+    if chasing_car_state['is_chasing_active']:
+        chasing_car_state['evasion_ticks_remaining'] -= 1
+        
+        if chasing_car_state['evasion_ticks_remaining'] <= 0:
+            # Evasion manoeuvre complete — return to centre
+            print(f"[CHALLENGE 2] Evasion complete for appearance #{chasing_car_state['appearances_count']}. Resuming normal driving.")
+            chasing_car_state['is_chasing_active'] = False
+            chasing_car_state['detection_cooldown'] = CHASING_DETECTION_COOLDOWN
+            with data_lock:
+                shared_data['steering_input'] = 0.0
+            steering_cooldown = 20  # Brief pause before normal processing resumes
+            return
+        else:
+            # Still evading — hold the evasion steering
+            with data_lock:
+                shared_data['steering_input'] = -1.0   # Steer hard left to dodge
+                shared_data['acceleration_input'] = 1.0 # Maintain speed during evasion
+            return
+    
+    # Only attempt detection if we haven't used up both appearances
+    # and the cooldown has expired
+    if (chasing_car_state['appearances_count'] < 2 
+            and chasing_car_state['detection_cooldown'] <= 0):
+        
+        with data_lock:
+            back_frame = shared_data['latest_back_frame']
+        
+        prev_back = chasing_car_state['prev_back_frame']
+        
+        if back_frame is not None:
+            car_detected = detect_chasing_car(back_frame, prev_back)
+            chasing_car_state['prev_back_frame'] = back_frame.copy()
+            
+            if car_detected:
+                chasing_car_state['consecutive_detections'] += 1
+                
+                # Debounce: require CHASING_DEBOUNCE_FRAMES consecutive detections
+                if chasing_car_state['consecutive_detections'] >= CHASING_DEBOUNCE_FRAMES:
+                    chasing_car_state['appearances_count'] += 1
+                    chasing_car_state['is_chasing_active'] = True
+                    chasing_car_state['consecutive_detections'] = 0
+                    
+                    # Set evasion duration based on which appearance this is
+                    if chasing_car_state['appearances_count'] == 1:
+                        chasing_car_state['evasion_ticks_remaining'] = CHASING_EVASION_TICKS_1ST
+                        print(f"[CHALLENGE 2]  Chasing car DETECTED (1st appearance)! "
+                              f"Evading for {CHASING_EVASION_TICKS_1ST * 5}ms. "
+                              f"Player has 10s window.")
+                    else:
+                        chasing_car_state['evasion_ticks_remaining'] = CHASING_EVASION_TICKS_2ND
+                        print(f"[CHALLENGE 2]  Chasing car DETECTED (2nd appearance)! "
+                              f"Evading for {CHASING_EVASION_TICKS_2ND * 5}ms. "
+                              f"Player has only 3s window!")
+                    
+                    # Immediately start evasion
+                    with data_lock:
+                        shared_data['steering_input'] = -1.0
+                        shared_data['acceleration_input'] = 1.0
+                        shared_data['trailing_car_detected'] = True
+                    return
+            else:
+                # Reset consecutive detection counter
+                chasing_car_state['consecutive_detections'] = 0
+    
+    # Reset trailing car flag when not actively chasing
+    with data_lock:
+        shared_data['trailing_car_detected'] = False
+    
+    # ==================================================================
+    # Normal processing continues below (steering cooldown, Challenge 1, etc.)
+    # ==================================================================
     
     if steering_cooldown > 0:
         steering_cooldown -= 1
@@ -381,10 +614,27 @@ if __name__ == '__main__':
         while is_running:
             with data_lock:
                 back_frame = shared_data['latest_back_frame']
+                trailing_detected = shared_data['trailing_car_detected']
             
             # Displays the back camera perspective safely without causing thread freezes
             if back_frame is not None:
-                back_resized = cv2.resize(back_frame, (400, 300))
+                back_display = back_frame.copy()
+                
+                # ==================================================================
+                # CHALLENGE 2: Visual indicator on back camera when chasing car detected
+                # ==================================================================
+                if trailing_detected or chasing_car_state['is_chasing_active']:
+                    # Draw red warning border
+                    h, w = back_display.shape[:2]
+                    cv2.rectangle(back_display, (0, 0), (w-1, h-1), (0, 0, 255), 4)
+                    cv2.putText(back_display, "!! CHASING CAR DETECTED !!",
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    app_num = chasing_car_state['appearances_count']
+                    ticks_left = chasing_car_state['evasion_ticks_remaining']
+                    cv2.putText(back_display, f"Appearance #{app_num} | Evading: {ticks_left*5}ms left",
+                                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                
+                back_resized = cv2.resize(back_display, (400, 300))
                 cv2.imshow("Back Camera Feed (Monitoring Trail Link)", back_resized)
             
             # Use short waitKey delay to process rendering updates smoothly
