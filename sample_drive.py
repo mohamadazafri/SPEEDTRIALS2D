@@ -211,6 +211,23 @@ def processing_task():
         front_frame = shared_data['latest_front_frame']
     
     if front_frame is not None:
+        # ==================================================================
+        # CHALLENGE 1: LOW LIGHT BRIGHTNESS DETECTION
+        # ==================================================================
+        # Convert to grayscale to isolate pure pixel value brightness intensity
+        gray = cv2.cvtColor(front_frame, cv2.COLOR_BGR2GRAY)
+        average_brightness = np.mean(gray)
+        
+        # If the average pixel value falls below the dark threshold, signal the headlights!
+        # Normal game view is bright blue city/road; Low Light drops near black.
+        if average_brightness < 45.0: 
+            print(f"[CHALLENGE 1] Low Light detected! Brightness: {average_brightness:.2f}. Recovering light...")
+            with data_lock:
+                shared_data['steering_input'] = 0.0
+                shared_data['acceleration_input'] = -1.0 # Reverse command to reset headlights
+            return
+        # ==================================================================
+
         hsv = cv2.cvtColor(front_frame, cv2.COLOR_BGR2HSV)
         frame_center_x = front_frame.shape[1] // 2
         
@@ -223,8 +240,6 @@ def processing_task():
         upper_red2 = np.array([179, 255, 255])
         lower_green = np.array([50, 80, 180])
         upper_green = np.array([75, 255, 255])
-        
-        # Yellow token HSV threshold parameters (Hue 20-35 range)
         lower_yellow = np.array([20, 100, 180])
         upper_yellow = np.array([35, 255, 255])
         
@@ -232,35 +247,28 @@ def processing_task():
         mask_red2 = cv2.inRange(hsv, lower_red2, upper_red2)
         mask_red = cv2.bitwise_or(mask_red1, mask_red2)
         mask_green = cv2.inRange(hsv, lower_green, upper_green)
-        mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow) # Yellow color mask
+        mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
         
-        # ==================================================================
-        # REGION OF INTEREST (ROI) FILTERING
-        # ==================================================================
         height, width = mask_red.shape[:2]
-        
-        # 1. Clear top 30% of the screen (eliminates UI background text noise)
         mask_red[0:int(height * 0.30), :] = 0
         mask_green[0:int(height * 0.30), :] = 0
         mask_yellow[0:int(height * 0.30), :] = 0
         
-        # 2. Clear bottom 15% of the screen (eliminates reflection from your own chassis)
         mask_red[int(height * 0.85):, :] = 0
         mask_green[int(height * 0.85):, :] = 0
         mask_yellow[int(height * 0.85):, :] = 0
-        # ==================================================================
         
         if not has_saved_debug:
             cv2.imwrite("debug_1_raw_frame.png", front_frame)
             cv2.imwrite("debug_2_red_mask.png", mask_red)
             cv2.imwrite("debug_3_green_mask.png", mask_green)
-            cv2.imwrite("debug_4_yellow_mask.png", mask_yellow) # Diagnostic yellow channel save
+            cv2.imwrite("debug_4_yellow_mask.png", mask_yellow)
             print("[DEBUG] Saved snapshots to your project folder!")
             has_saved_debug = True
         
         contours_red, _ = cv2.findContours(mask_red, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         contours_green, _ = cv2.findContours(mask_green, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        contours_yellow, _ = cv2.findContours(mask_yellow, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE) # Yellow contours extraction
+        contours_yellow, _ = cv2.findContours(mask_yellow, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         
         # PRIORITY 1: Dodge Red Tokens
         if contours_red:
@@ -282,23 +290,22 @@ def processing_task():
                         shared_data['acceleration_input'] = target_acceleration
                     return
 
-        # PRIORITY 2 - Dodge Yellow Tokens (Avoids 5-second dynamic corruption states)
+        # PRIORITY 2: Dodge Yellow Tokens
         danger_yellows = []
         for c in contours_yellow:
             area = cv2.contourArea(c)
-            if area > 200: # Filter out minor background image artifacts
+            if area > 200:
                 x, y, w, h = cv2.boundingRect(c)
-                danger_yellows.append((area, x, y, w, h, y + h)) # Track bottom coordinates for proximity sorting
+                danger_yellows.append((area, x, y, w, h, y + h))
 
         if danger_yellows:
-            # Sort by token_bottom descending = closest yellow token to the car is handled first
             danger_yellows.sort(key=lambda t: t[5], reverse=True)
             area, x, y, w, h, token_bottom = danger_yellows[0]
             yellow_center_x = x + w // 2
 
-            if abs(yellow_center_x - frame_center_x) < 130: # 130px center track safety band
+            if abs(yellow_center_x - frame_center_x) < 130:
                 target_steering = -1.0 if yellow_center_x >= frame_center_x else 1.0
-                steering_cooldown = 8 # Fast stabilization recovery step length
+                steering_cooldown = 8
                 print(f"[YELLOW] Dodging yellow token at x={yellow_center_x}, steering={target_steering}")
                 with data_lock:
                     shared_data['steering_input'] = target_steering
@@ -345,7 +352,7 @@ def send_controls_task():
         control_conn = None
 
 # ---------------------------------------------------------
-# Main (Scheduler Initialization)
+# Main (Scheduler Initialization & Safe Main Window Loop)
 # ---------------------------------------------------------
 if __name__ == '__main__':
     print("Initializing RTSE Sample Drive...")
@@ -368,12 +375,26 @@ if __name__ == '__main__':
     t_controls.start()
     
     try:
+        # ==================================================================
+        # SAFE RENDERING ZONE: Main thread handles OpenCV GUI window outputs
+        # ==================================================================
         while is_running:
-            time.sleep(1)
+            with data_lock:
+                back_frame = shared_data['latest_back_frame']
+            
+            # Displays the back camera perspective safely without causing thread freezes
+            if back_frame is not None:
+                back_resized = cv2.resize(back_frame, (400, 300))
+                cv2.imshow("Back Camera Feed (Monitoring Trail Link)", back_resized)
+            
+            # Use short waitKey delay to process rendering updates smoothly
+            if cv2.waitKey(30) & 0xFF == 27: # Esc key breaks loop cleanly
+                break
     except KeyboardInterrupt:
         print("\nKeyboard Interrupt detected. Stopping system...")
         is_running = False
 
+    is_running = False
     t_front_camera.join()
     t_back_camera.join()
     t_processing.join()
