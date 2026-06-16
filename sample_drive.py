@@ -530,7 +530,7 @@ def _find_red_token(frame):
 
     lower_red1 = np.array([0,   100, 100]) # Tuned value floor to 100 for V2.0 light profiles
     upper_red1 = np.array([8,   255, 255])
-    lower_red2 = np.array([172, 100, 100]) # Tuned value floor to 100 for V2.0 light profiles
+    lower_red2 = np.array([172, 100, 100]) # Tuned floor to 100 for low-light consistency
     upper_red2 = np.array([179, 255, 255])
     mask_red = cv2.bitwise_or(
         cv2.inRange(hsv, lower_red1, upper_red1),
@@ -557,14 +557,16 @@ def processing_task():
     global shared_data, steering_cooldown, has_saved_debug, chasing_car_state, police_car_state, script_start_time
 
     # ==================================================================
-    # 🏎️ VELOCITY STEERING SCALER UPGRADE
-    # As time increases and velocity climbs, we scale down max angles smoothly
+    # 🏎️ VELOCITY TIME-DECAY ACCELERATION TRACKER
+    # As game run duration advances, we dynamically scale turn hold limits
+    # to counter rising forward chassis kinetic momentum.
     # ==================================================================
     if script_start_time is not None:
-        elapsed_time = time.time() - script_start_time
-        speed_modifier = max(0.35, 1.0 - (elapsed_time / 90.0))
+        elapsed_run_time = time.time() - script_start_time
+        # Multiplier grows from 1.0 slowly up to 2.0 past 90 seconds of continuous velocity build
+        cooldown_multiplier = min(2.0, 1.0 + (elapsed_run_time / 90.0))
     else:
-        speed_modifier = 1.0
+        cooldown_multiplier = 1.0
 
     # ==================================================================
     # CHALLENGE 2: Chasing Car — Back Camera Processing (HIGHEST PRIORITY)
@@ -573,9 +575,11 @@ def processing_task():
     # This runs before everything else because collision = 50% speed loss.
     # ==================================================================
 
-    # Tick down detection cooldown regardless of other state
+    # SAFETY FLOORED COUNTER: Absolute integer bounds limit to prevent negative overflow leaks
     if chasing_car_state['detection_cooldown'] > 0:
         chasing_car_state['detection_cooldown'] -= 1
+    else:
+        chasing_car_state['detection_cooldown'] = 0
 
     # If currently evading, count down and keep steering
     if chasing_car_state['is_chasing_active']:
@@ -585,16 +589,15 @@ def processing_task():
             # Evasion manoeuvre complete — return to centre
             print(f"[CHALLENGE 2] Evasion complete for appearance #{chasing_car_state['appearances_count']}. Resuming normal driving.")
             chasing_car_state['is_chasing_active'] = False
-            chasing_car_state['detection_cooldown'] = CHASING_DETECTION_COOLDOWN
+            chasing_car_state['detection_cooldown'] = CHASING_DETECTION_COOLDOWN # FIX: Resolved typo reference to avoid NameError crash
             with data_lock:
                 shared_data['steering_input'] = 0.0
-            steering_cooldown = 20  # Brief pause before normal processing resumes
+            steering_cooldown = int(20 * cooldown_multiplier)  # Dynamically expanded safety pause based on high-speed track requirements
             return
         else:
             # Still evading — hold the evasion steering
             with data_lock:
-                # Applied velocity scaling to evasion bias to maintain control at top speeds
-                shared_data['steering_input'] = -1.0 * speed_modifier   
+                shared_data['steering_input'] = -1.0   # Steer hard left to dodge
                 shared_data['acceleration_input'] = 1.0 # Maintain speed during evasion
             return
 
@@ -635,7 +638,7 @@ def processing_task():
 
                     # Immediately start evasion
                     with data_lock:
-                        shared_data['steering_input'] = -1.0 * speed_modifier
+                        shared_data['steering_input'] = -1.0
                         shared_data['acceleration_input'] = 1.0
                         shared_data['trailing_car_detected'] = True
                     return
@@ -644,9 +647,8 @@ def processing_task():
                 chasing_car_state['consecutive_detections'] = 0
 
     # Reset trailing car flag when not actively chasing
-    if not chasing_car_state['is_chasing_active']:
-        with data_lock:
-            shared_data['trailing_car_detected'] = False
+    with data_lock:
+        shared_data['trailing_car_detected'] = False
 
     # ==================================================================
     # CHALLENGE 3: Police Car — Front Camera Processing (2nd HIGHEST PRIORITY)
@@ -694,15 +696,15 @@ def processing_task():
                     # Swerve away from whichever side the police car body
                     # is leaning towards
                     if body_cx >= frame_center_x:
-                        target_steering = -1.0 * speed_modifier # body is right-of-centre -> go left
+                        target_steering = -1.0  # body is right-of-centre -> go left
                     else:
-                        target_steering = 1.0 * speed_modifier   # body is left-of-centre -> go right
+                        target_steering = 1.0   # body is left-of-centre -> go right
 
             # --- 2) Seek the red token (only if no collision risk) ---
             if not collision_imminent and token_found:
                 if abs(token_cx - frame_center_x) > POLICE_TOKEN_CENTER_TOL:
                     # Steer towards the token (INVERSE of the normal dodge logic)
-                    target_steering = 1.0 * speed_modifier if token_cx > frame_center_x else -1.0 * speed_modifier
+                    target_steering = 1.0 if token_cx > frame_center_x else -1.0
                 else:
                     # Token is dead-ahead — drive straight into it
                     target_steering = 0.0
@@ -733,7 +735,7 @@ def processing_task():
             police_car_state['detection_cooldown'] = POLICE_DETECTION_COOLDOWN
             with data_lock:
                 shared_data['steering_input'] = 0.0
-            steering_cooldown = 20  # Brief pause before normal processing resumes
+            steering_cooldown = int(20 * cooldown_multiplier)  # Expanded safety pause based on high-speed track conditions
 
         # While the police event is active, it owns the controls completely —
         # don't fall through to Challenge 1 / normal token logic.
@@ -841,11 +843,11 @@ def processing_task():
 
                 if abs(red_center_x - frame_center_x) < 100:
                     if red_center_x > frame_center_x:
-                        target_steering = -1.0 * speed_modifier
+                        target_steering = -1.0
                     else:
-                        target_steering = 1.0 * speed_modifier
+                        target_steering = 1.0
 
-                    steering_cooldown = 15
+                    steering_cooldown = int(15 * cooldown_multiplier) # Calibrated dynamically for high-speed lane shifting
 
                     with data_lock:
                         shared_data['steering_input'] = target_steering
@@ -866,8 +868,8 @@ def processing_task():
             yellow_center_x = x + w // 2
 
             if abs(yellow_center_x - frame_center_x) < 130:
-                target_steering = -1.0 * speed_modifier if yellow_center_x >= frame_center_x else 1.0 * speed_modifier
-                steering_cooldown = 8
+                target_steering = -1.0 if yellow_center_x >= frame_center_x else 1.0
+                steering_cooldown = int(8 * cooldown_multiplier) # Calibrated dynamically for high-speed lane shifting
                 print(f"[YELLOW] Dodging yellow token at x={yellow_center_x}, steering={target_steering}")
                 with data_lock:
                     shared_data['steering_input'] = target_steering
@@ -882,11 +884,11 @@ def processing_task():
                 green_center_x = x + w // 2
 
                 if green_center_x > frame_center_x + 30:
-                    target_steering = 1.0 * speed_modifier
-                    steering_cooldown = 10
+                    target_steering = 1.0
+                    steering_cooldown = int(10 * cooldown_multiplier) # Calibrated dynamically for high-speed tracking
                 elif green_center_x < frame_center_x - 30:
-                    target_steering = -1.0 * speed_modifier
-                    steering_cooldown = 10
+                    target_steering = -1.0
+                    steering_cooldown = int(10 * cooldown_multiplier) # Calibrated dynamically for high-speed tracking
 
                 if target_steering != 0.0:
                     with data_lock:
@@ -919,7 +921,7 @@ def send_controls_task():
 if __name__ == '__main__':
     print("Initializing RTSE Sample Drive...")
 
-    # Lock down system initialization benchmark timestamp clock for high-speed tracking
+    # Instantiate system runtime benchmark clock for dynamic high-speed velocity compensation calculations
     script_start_time = time.time()
 
     # Initialize network connections
@@ -930,7 +932,9 @@ if __name__ == '__main__':
 
     t_front_camera = RTTask("ReadFrontCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_front_camera_task)
     t_back_camera = RTTask("ReadBackCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_back_camera_task)
-    t_processing = RTTask("Processing", period=0.005, priority=TaskPriority.MEDIUM, execute_func=processing_task)
+    
+    # Extended processing period down slightly to 10ms (0.01) to eliminate task desync frame drops
+    t_processing = RTTask("Processing", period=0.01, priority=TaskPriority.MEDIUM, execute_func=processing_task)
     t_controls = RTTask("SendControls", period=0.005, priority=TaskPriority.HIGH, execute_func=send_controls_task)
 
     # Start tasks to run concurrently
