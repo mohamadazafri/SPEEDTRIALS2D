@@ -31,6 +31,7 @@ is_running = True
 # Global Tracking Variables for the Logic
 steering_cooldown = 0   # Counts down how long a "tap" should last
 has_saved_debug = False # Flag to save debug images only once
+script_start_time = None # Tracks elapsed system time for speed scaling calculations
 
 # ==================================================================
 # CHALLENGE 2: Chasing Car — Global Tracking Variables
@@ -41,7 +42,7 @@ has_saved_debug = False # Flag to save debug images only once
 # If it collides with the player → 50% speed loss.
 #
 # Strategy: detect motion in the back camera via frame differencing.
-#           When detected, immediately steer left to evade.
+#            When detected, immediately steer left to evade.
 # ==================================================================
 chasing_car_state = {
     'prev_back_frame': None,         # Previous back frame for differencing
@@ -53,8 +54,8 @@ chasing_car_state = {
 }
 # Timing constants (1 tick = 5ms task period)
 CHASING_DEBOUNCE_FRAMES   = 3      # Only 3 consecutive detections needed (~15ms) — react FAST
-CHASING_EVASION_TICKS_1ST = 500    # 500 ticks × 5ms = 2.5s evasion steering for 1st car
-CHASING_EVASION_TICKS_2ND = 300    # 300 ticks × 5ms = 1.5s evasion steering for 2nd car
+CHASING_EVASION_TICKS_1ST = 35     # 500 ticks × 5ms = 2.5s evasion steering for 1st car — Optimized to 35 (~175ms) to execute a lane shift instead of a wall smash
+CHASING_EVASION_TICKS_2ND = 25     # 300 ticks × 5ms = 1.5s evasion steering for 2nd car — Optimized to 25 (~125ms) for high-speed micro-evasion
 CHASING_DETECTION_COOLDOWN = 4000  # 4000 ticks × 5ms = 20s cooldown between appearances
 CHASING_MOTION_AREA_THRESH = 500   # Min motion contour area (px²) — lowered for sensitivity
 CHASING_COLOR_AREA_THRESH  = 300   # Min color contour area (px²) for car-color detection
@@ -79,16 +80,16 @@ CHASING_PIXEL_RATIO_THRESH = 0.02  # If >2% of ROI pixels show motion, car is pr
 #      of the green/red/yellow tokens or the road/sky, so it's a
 #      reliable, low-false-positive trigger.
 #   2. Once the event is active:
-#        a) If the police car's BODY is large/centred and its bottom
-#           edge is near the bottom of the frame (i.e. a collision is
-#           imminent) -> swerve away from it FIRST. Avoiding game over
-#           always wins.
-#        b) Otherwise, actively STEER TOWARDS the nearest red token —
-#           this is the INVERSE of the normal "dodge red" behaviour
-#           (Priority 1 in the main loop), which is why this whole
-#           block must run and `return` BEFORE that logic is reached.
-#        c) If neither is visible, keep driving straight while
-#           continuing to scan every frame.
+#         a) If the police car's BODY is large/centred and its bottom
+#            edge is near the bottom of the frame (i.e. a collision is
+#            imminent) -> swerve away from it FIRST. Avoiding game over
+#            always wins.
+#         b) Otherwise, actively STEER TOWARDS the nearest red token —
+#            this is the INVERSE of the normal "dodge red" behaviour
+#            (Priority 1 in the main loop), which is why this whole
+#            block must run and `return` BEFORE that logic is reached.
+#         c) If neither is visible, keep driving straight while
+#            continuing to scan every frame.
 #   3. When the 10s window ends, log whether a red token was collected.
 #      The simulator itself applies the -50% speed penalty if not —
 #      our job is purely to behave correctly during the window.
@@ -113,7 +114,6 @@ POLICE_COLLISION_Y_RATIO    = 0.78  # If the body's bottom edge passes this frac
 POLICE_ROI_Y_START          = 0.25  # Ignore the sky/background above this fraction of height
 POLICE_TOKEN_CENTER_TOL     = 15    # px tolerance to consider the red token "dead ahead"
 POLICE_TOKEN_CAUGHT_Y_RATIO = 0.80  # token bbox bottom must pass this fraction of height
-                                     # (i.e. very close to the car) to count as "caught"
 
 # ---------------------------------------------------------
 # Real-Time Scheduling Framework (Do not change this in your code)
@@ -432,9 +432,9 @@ def _detect_police_lightbar(frame):
 
     # Bright/saturated red (police light), slightly stricter than the
     # token red mask to avoid confusing it with red tokens
-    lower_red1 = np.array([0,   140, 180])
+    lower_red1 = np.array([0,   140, 100]) # Tuned value floor to 100 for V2.0 light profiles
     upper_red1 = np.array([8,   255, 255])
-    lower_red2 = np.array([172, 140, 180])
+    lower_red2 = np.array([172, 140, 100]) # Tuned value floor to 100 for V2.0 light profiles
     upper_red2 = np.array([179, 255, 255])
     mask_red = cv2.bitwise_or(
         cv2.inRange(hsv, lower_red1, upper_red1),
@@ -442,7 +442,7 @@ def _detect_police_lightbar(frame):
     )
 
     # Bright/saturated blue (police light)
-    lower_blue = np.array([95,  140, 180])
+    lower_blue = np.array([95,  140, 100]) # Tuned value floor to 100 for V2.0 light profiles
     upper_blue = np.array([130, 255, 255])
     mask_blue = cv2.inRange(hsv, lower_blue, upper_blue)
 
@@ -528,9 +528,9 @@ def _find_red_token(frame):
     height, width = frame.shape[:2]
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    lower_red1 = np.array([0,   100, 180])
+    lower_red1 = np.array([0,   100, 100]) # Tuned value floor to 100 for V2.0 light profiles
     upper_red1 = np.array([8,   255, 255])
-    lower_red2 = np.array([172, 100, 180])
+    lower_red2 = np.array([172, 100, 100]) # Tuned value floor to 100 for V2.0 light profiles
     upper_red2 = np.array([179, 255, 255])
     mask_red = cv2.bitwise_or(
         cv2.inRange(hsv, lower_red1, upper_red1),
@@ -554,7 +554,17 @@ def _find_red_token(frame):
 
 
 def processing_task():
-    global shared_data, steering_cooldown, has_saved_debug, chasing_car_state, police_car_state
+    global shared_data, steering_cooldown, has_saved_debug, chasing_car_state, police_car_state, script_start_time
+
+    # ==================================================================
+    # 🏎️ VELOCITY STEERING SCALER UPGRADE
+    # As time increases and velocity climbs, we scale down max angles smoothly
+    # ==================================================================
+    if script_start_time is not None:
+        elapsed_time = time.time() - script_start_time
+        speed_modifier = max(0.35, 1.0 - (elapsed_time / 90.0))
+    else:
+        speed_modifier = 1.0
 
     # ==================================================================
     # CHALLENGE 2: Chasing Car — Back Camera Processing (HIGHEST PRIORITY)
@@ -583,7 +593,8 @@ def processing_task():
         else:
             # Still evading — hold the evasion steering
             with data_lock:
-                shared_data['steering_input'] = -1.0   # Steer hard left to dodge
+                # Applied velocity scaling to evasion bias to maintain control at top speeds
+                shared_data['steering_input'] = -1.0 * speed_modifier   
                 shared_data['acceleration_input'] = 1.0 # Maintain speed during evasion
             return
 
@@ -624,7 +635,7 @@ def processing_task():
 
                     # Immediately start evasion
                     with data_lock:
-                        shared_data['steering_input'] = -1.0
+                        shared_data['steering_input'] = -1.0 * speed_modifier
                         shared_data['acceleration_input'] = 1.0
                         shared_data['trailing_car_detected'] = True
                     return
@@ -633,8 +644,9 @@ def processing_task():
                 chasing_car_state['consecutive_detections'] = 0
 
     # Reset trailing car flag when not actively chasing
-    with data_lock:
-        shared_data['trailing_car_detected'] = False
+    if not chasing_car_state['is_chasing_active']:
+        with data_lock:
+            shared_data['trailing_car_detected'] = False
 
     # ==================================================================
     # CHALLENGE 3: Police Car — Front Camera Processing (2nd HIGHEST PRIORITY)
@@ -682,15 +694,15 @@ def processing_task():
                     # Swerve away from whichever side the police car body
                     # is leaning towards
                     if body_cx >= frame_center_x:
-                        target_steering = -1.0  # body is right-of-centre -> go left
+                        target_steering = -1.0 * speed_modifier # body is right-of-centre -> go left
                     else:
-                        target_steering = 1.0   # body is left-of-centre -> go right
+                        target_steering = 1.0 * speed_modifier   # body is left-of-centre -> go right
 
             # --- 2) Seek the red token (only if no collision risk) ---
             if not collision_imminent and token_found:
                 if abs(token_cx - frame_center_x) > POLICE_TOKEN_CENTER_TOL:
                     # Steer towards the token (INVERSE of the normal dodge logic)
-                    target_steering = 1.0 if token_cx > frame_center_x else -1.0
+                    target_steering = 1.0 * speed_modifier if token_cx > frame_center_x else -1.0 * speed_modifier
                 else:
                     # Token is dead-ahead — drive straight into it
                     target_steering = 0.0
@@ -714,8 +726,7 @@ def processing_task():
             if police_car_state['red_token_caught']:
                 print("[CHALLENGE 3] Police event ended — red token collected, no penalty.")
             else:
-                print("[CHALLENGE 3] Police event ended — NO red token collected. "
-                      "Expect a -50% speed penalty.")
+                print("[CHALLENGE 3] Police event ended — NO red token collected. Expect a -50% speed penalty.")
 
             police_car_state['is_active'] = False
             police_car_state['red_token_caught'] = False
@@ -785,13 +796,13 @@ def processing_task():
         target_steering = 0.0
         target_acceleration = 1.0
 
-        lower_red1 = np.array([0,   100, 180])
+        lower_red1 = np.array([0,   100, 100]) # Lowered value floor to 100 for weather profile stability
         upper_red1 = np.array([8,   255, 255])
-        lower_red2 = np.array([172, 100, 180])
+        lower_red2 = np.array([172, 100, 100]) # Lowered value floor to 100 for weather profile stability
         upper_red2 = np.array([179, 255, 255])
-        lower_green = np.array([50, 80, 180])
+        lower_green = np.array([50, 80, 100])  # Lowered value floor to 100 for weather profile stability
         upper_green = np.array([75, 255, 255])
-        lower_yellow = np.array([20, 100, 180])
+        lower_yellow = np.array([20, 100, 100]) # Lowered value floor to 100 for weather profile stability
         upper_yellow = np.array([35, 255, 255])
 
         mask_red1 = cv2.inRange(hsv, lower_red1, upper_red1)
@@ -830,9 +841,9 @@ def processing_task():
 
                 if abs(red_center_x - frame_center_x) < 100:
                     if red_center_x > frame_center_x:
-                        target_steering = -1.0
+                        target_steering = -1.0 * speed_modifier
                     else:
-                        target_steering = 1.0
+                        target_steering = 1.0 * speed_modifier
 
                     steering_cooldown = 15
 
@@ -855,7 +866,7 @@ def processing_task():
             yellow_center_x = x + w // 2
 
             if abs(yellow_center_x - frame_center_x) < 130:
-                target_steering = -1.0 if yellow_center_x >= frame_center_x else 1.0
+                target_steering = -1.0 * speed_modifier if yellow_center_x >= frame_center_x else 1.0 * speed_modifier
                 steering_cooldown = 8
                 print(f"[YELLOW] Dodging yellow token at x={yellow_center_x}, steering={target_steering}")
                 with data_lock:
@@ -871,10 +882,10 @@ def processing_task():
                 green_center_x = x + w // 2
 
                 if green_center_x > frame_center_x + 30:
-                    target_steering = 1.0
+                    target_steering = 1.0 * speed_modifier
                     steering_cooldown = 10
                 elif green_center_x < frame_center_x - 30:
-                    target_steering = -1.0
+                    target_steering = -1.0 * speed_modifier
                     steering_cooldown = 10
 
                 if target_steering != 0.0:
@@ -907,6 +918,9 @@ def send_controls_task():
 # ---------------------------------------------------------
 if __name__ == '__main__':
     print("Initializing RTSE Sample Drive...")
+
+    # Lock down system initialization benchmark timestamp clock for high-speed tracking
+    script_start_time = time.time()
 
     # Initialize network connections
     threading.Thread(target=setup_control_server, daemon=True).start()
