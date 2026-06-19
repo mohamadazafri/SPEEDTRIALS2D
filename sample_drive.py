@@ -14,7 +14,7 @@ import ctypes
 CAMERA_HOST = '127.0.0.1'
 FRONT_CAMERA_PORT = 8080
 BACK_CAMERA_PORT = 8082
-CONTROL_HOST = '0.0.0.0'
+CONTROL_HOST = '127.0.0.1'
 CONTROL_PORT = 8081
 
 # Shared Resources with Mutex Lock for Concurrency
@@ -47,16 +47,15 @@ tactical_checklist = {
 }
 
 # ==================================================================
-# The chasing car appears TWICE during the game.
-# 1st appearance: player has 10 seconds to avoid it.
-# 2nd appearance: player has only 3 seconds to avoid it.
-# If it collides with the player → 50% speed loss.
-#
-# Strategy: detect motion in the back camera via frame differencing.
-#            When detected, immediately steer left to evade.
+# CHALLENGE 2: Chasing Car — Global Tracking Variables
 # ==================================================================
 chasing_car_state = {
-    'prev_back_frame': None,         # Previous back frame for differencing
+    'prev_back_frame': None,         
+    'appearances_count': 0,          
+    'is_chasing_active': False,      
+    'evasion_ticks_remaining': 0,    
+    'detection_cooldown': 0,         
+    'consecutive_detections': 0,     
 }
 CHASING_DEBOUNCE_FRAMES   = 3      
 CHASING_EVASION_TICKS_1ST = 35     
