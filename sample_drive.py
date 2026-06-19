@@ -14,7 +14,7 @@ import ctypes
 CAMERA_HOST = '127.0.0.1'
 FRONT_CAMERA_PORT = 8080
 BACK_CAMERA_PORT = 8082
-CONTROL_HOST = '127.0.0.1'
+CONTROL_HOST = '0.0.0.0'
 CONTROL_PORT = 8081
 
 # Shared Resources with Mutex Lock for Concurrency
@@ -40,24 +40,24 @@ darkness_consecutive_ticks = 0 # Prevents transient camera glitches from trigger
 # ==================================================================
 tactical_checklist = {
     'darkness_passed':     False,
-    'police_passed':       False,
+    'police_passed':        False,
     'chasing_a_passed':    False,
     'chasing_b_passed':    False,
     'golden_lane_passed':  False
 }
 
 # ==================================================================
-# CHALLENGE 2: Chasing Car — Global Tracking Variables
+# CHALLENGE 2: Chasing Car — Global State Machine Array (FIXED)
 # ==================================================================
 chasing_car_state = {
-    'prev_back_frame': None,         
-    'appearances_count': 0,          
-    'is_chasing_active': False,      
-    'evasion_ticks_remaining': 0,    
-    'detection_cooldown': 0,         
-    'consecutive_detections': 0,     
+    'prev_back_frame':          None,  # Previous back frame for differencing
+    'appearances_count':        0,     # Total tracking entries encountered
+    'is_chasing_active':        False, # Status flag indicating active evasion deployment
+    'evasion_ticks_remaining':  0,     # Maneuver lifecycle ticker countdown
+    'detection_cooldown':       0,     # Guard window frame offset limit
+    'consecutive_detections':   0      # Debounce consistency verify tracking filter
 }
-CHASING_DEBOUNCE_FRAMES   = 3      
+CHASING_DEBOUNCE_FRAMES    = 3      
 CHASING_EVASION_TICKS_1ST = 35     
 CHASING_EVASION_TICKS_2ND = 25     
 CHASING_DETECTION_COOLDOWN = 4000  
@@ -73,7 +73,7 @@ police_car_state = {
     'is_active':              False,  
     'event_ticks_remaining':  0,      
     'red_token_caught':       False,  
-    'detection_cooldown':     0,      
+    'detection_cooldown':       0,      
     'consecutive_detections': 0,      
 }
 POLICE_DEBOUNCE_FRAMES      = 3     
@@ -84,7 +84,7 @@ POLICE_LIGHT_MAX_GAP        = 60
 POLICE_BODY_AREA_THRESH     = 600   
 POLICE_COLLISION_Y_RATIO    = 0.78  
 POLICE_ROI_Y_START          = 0.25  
-POLICE_TOKEN_CENTER_TOL     = 15    
+POLICE_TOKEN_CENTER_TOL    = 15    
 POLICE_TOKEN_CAUGHT_Y_RATIO = 0.80  
 
 # ==================================================================
@@ -248,16 +248,11 @@ def read_single_camera(sock, window_name, data_key):
     except Exception:
         pass
 
-def read_front_camera_task():
-    read_single_camera(front_camera_sock, "Front Camera", 'latest_front_frame')
-
-def read_back_camera_task():
-    read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame')
+def read_front_camera_task(): read_single_camera(front_camera_sock, "Front Camera", 'latest_front_frame')
+def read_back_camera_task():  read_single_camera(back_camera_sock, "Back Camera", 'latest_back_frame')
 
 def _detect_chasing_car_motion(current_frame, prev_frame):
-    if current_frame is None or prev_frame is None:
-        return False
-    if current_frame.shape != prev_frame.shape:
+    if current_frame is None or prev_frame is None or current_frame.shape != prev_frame.shape:
         return False
 
     diff = cv2.absdiff(current_frame, prev_frame)
@@ -288,30 +283,16 @@ def _detect_chasing_car_color(frame):
     height, width = frame.shape[:2]
     roi_y = int(height * CHASING_ROI_Y_START)
     roi = frame[roi_y:, :]
-
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
-    lower_dark = np.array([0, 0, 30])
-    upper_dark = np.array([180, 80, 120])
-    mask_dark = cv2.inRange(hsv, lower_dark, upper_dark)
-
-    lower_red1 = np.array([0, 120, 100])
-    upper_red1 = np.array([10, 255, 255])
-    lower_red2 = np.array([165, 120, 100])
-    upper_red2 = np.array([180, 255, 255])
+    mask_dark = cv2.inRange(hsv, np.array([0, 0, 30]), np.array([180, 80, 120]))
+    lower_red1, upper_red1 = np.array([0, 120, 100]), np.array([10, 255, 255])
+    lower_red2, upper_red2 = np.array([165, 120, 100]), np.array([180, 255, 255])
     mask_red = cv2.bitwise_or(cv2.inRange(hsv, lower_red1, upper_red1), cv2.inRange(hsv, lower_red2, upper_red2))
+    mask_blue = cv2.inRange(hsv, np.array([100, 100, 80]), np.array([130, 255, 255]))
+    mask_white = cv2.inRange(hsv, np.array([0, 0, 200]), np.array([180, 40, 255]))
 
-    lower_blue = np.array([100, 100, 80])
-    upper_blue = np.array([130, 255, 255])
-    mask_blue = cv2.inRange(hsv, lower_blue, upper_blue)
-
-    lower_white = np.array([0, 0, 200])
-    upper_white = np.array([180, 40, 255])
-    mask_white = cv2.inRange(hsv, lower_white, upper_white)
-
-    mask_combined = cv2.bitwise_or(mask_dark, mask_red)
-    mask_combined = cv2.bitwise_or(mask_combined, mask_blue)
-    mask_combined = cv2.bitwise_or(mask_combined, mask_white)
+    mask_combined = cv2.bitwise_or(cv2.bitwise_or(cv2.bitwise_or(mask_dark, mask_red), mask_blue), mask_white)
 
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
     mask_combined = cv2.morphologyEx(mask_combined, cv2.MORPH_CLOSE, kernel)
@@ -337,18 +318,12 @@ def _detect_police_lightbar(frame):
     height, width = frame.shape[:2]
     roi_y = int(height * POLICE_ROI_Y_START)
     roi = frame[roi_y:, :]
-
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
-    lower_red1 = np.array([0, 140, 100])
-    upper_red1 = np.array([8, 255, 255])
-    lower_red2 = np.array([172, 140, 100])
-    upper_red2 = np.array([179, 255, 255])
+    lower_red1, upper_red1 = np.array([0, 140, 100]), np.array([8, 255, 255])
+    lower_red2, upper_red2 = np.array([172, 140, 100]), np.array([179, 255, 255])
     mask_red = cv2.bitwise_or(cv2.inRange(hsv, lower_red1, upper_red1), cv2.inRange(hsv, lower_red2, upper_red2))
-
-    lower_blue = np.array([95, 140, 100])
-    upper_blue = np.array([130, 255, 255])
-    mask_blue = cv2.inRange(hsv, lower_blue, upper_blue)
+    mask_blue = cv2.inRange(hsv, np.array([95, 140, 100]), np.array([130, 255, 255]))
 
     contours_red, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours_blue, _ = cv2.findContours(mask_blue, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -361,8 +336,7 @@ def _detect_police_lightbar(frame):
         for (bx, by, bw, bh) in blue_blobs:
             blue_cx, blue_cy = bx + bw // 2, by + bh // 2
             if abs(red_cy - blue_cy) < 20 and abs(red_cx - blue_cx) < POLICE_LIGHT_MAX_GAP:
-                center_x = (red_cx + blue_cx) // 2
-                return True, center_x
+                return True, (red_cx + blue_cx) // 2
     return False, None
 
 def _detect_police_body(frame):
@@ -372,7 +346,6 @@ def _detect_police_body(frame):
     height, width = frame.shape[:2]
     roi_y = int(height * POLICE_ROI_Y_START)
     roi = frame[roi_y:, :]
-
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     lower_dark = np.array([0, 0, 20])
     upper_dark = np.array([180, 90, 110])
@@ -400,10 +373,8 @@ def _find_red_token(frame):
     height, width = frame.shape[:2]
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    lower_red1 = np.array([0, 100, 100])
-    upper_red1 = np.array([8, 255, 255])
-    lower_red2 = np.array([172, 100, 100])
-    upper_red2 = np.array([179, 255, 255])
+    lower_red1, upper_red1 = np.array([0, 100, 100]), np.array([8, 255, 255])
+    lower_red2, upper_red2 = np.array([172, 100, 100]), np.array([179, 255, 255])
     mask_red = cv2.bitwise_or(cv2.inRange(hsv, lower_red1, upper_red1), cv2.inRange(hsv, lower_red2, upper_red2))
 
     mask_red[0:int(height * 0.30), :] = 0
@@ -420,9 +391,6 @@ def _find_red_token(frame):
     x, y, w, h = cv2.boundingRect(largest)
     return True, x + w // 2, (x, y, w, h)
 
-# ==================================================================
-# 🌟 Spatial Segmentation Multi-Lane Parser
-# ==================================================================
 def _detect_golden_lane_text(frame):
     if frame is None:
         return False, None
@@ -431,10 +399,7 @@ def _detect_golden_lane_text(frame):
     ui_roi = frame[0:int(height * 0.20), :]
     hsv = cv2.cvtColor(ui_roi, cv2.COLOR_BGR2HSV)
 
-    lower_text = np.array([0, 0, 200])
-    upper_text = np.array([180, 60, 255])
-    mask_text = cv2.inRange(hsv, lower_text, upper_text)
-
+    mask_text = cv2.inRange(hsv, np.array([0, 0, 200]), np.array([180, 60, 255]))
     contours, _ = cv2.findContours(mask_text, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     valid_contours = [c for c in contours if cv2.contourArea(c) > 120]
     
@@ -445,17 +410,61 @@ def _detect_golden_lane_text(frame):
     tx, ty, tw, th = cv2.boundingRect(largest_text)
     text_center_x = tx + tw // 2
 
-    if text_center_x < int(width * 0.40):
-        return True, 1  
-    elif text_center_x > int(width * 0.60):
-        return True, 3  
-    else:
-        return True, 2  
-
+    if text_center_x < int(width * 0.40): return True, 1  
+    elif text_center_x > int(width * 0.60): return True, 3  
+    else: return True, 2  
 
 def processing_task():
     global shared_data, steering_cooldown, has_saved_debug, chasing_car_state, police_car_state, golden_lane_state, tactical_checklist, script_start_time, darkness_consecutive_ticks
 
+    # ── 1. GLOBAL LATCH MONITOR (CRITICAL RESTART FLUSH) ──
+    if keyboard.is_pressed('r'):
+        # Flush all tracking dictionaries to clean configurations
+        chasing_car_state.update({'prev_back_frame': None, 'appearances_count': 0, 'is_chasing_active': False, 'evasion_ticks_remaining': 0, 'detection_cooldown': 0, 'consecutive_detections': 0})
+        police_car_state.update({'is_active': False, 'event_ticks_remaining': 0, 'red_token_caught': False, 'detection_cooldown': 0, 'consecutive_detections': 0})
+        golden_lane_state.update({'is_active': False, 'target_lane': None, 'event_ticks_remaining': 0, 'detection_cooldown': 0})
+        tactical_checklist.update({'darkness_passed': False, 'police_passed': False, 'chasing_a_passed': False, 'chasing_b_passed': False, 'golden_lane_passed': False})
+        script_start_time = time.time()
+        darkness_consecutive_ticks = 0
+        with data_lock:
+            shared_data['steering_input'] = 0.0
+            shared_data['acceleration_input'] = 1.0
+            shared_data['trailing_car_detected'] = False
+        steering_cooldown = 0
+        print("[RESET] Clean slate re-instantiated across all state structures.")
+        return
+
+    # ── 2. DATA EXTRACTION LAYER (FETCH FRAMES ONCE) ──
+    with data_lock:
+        front_frame = shared_data['latest_front_frame']
+        back_frame = shared_data['latest_back_frame']
+
+    # ── 3. CHALLENGE 1: LOW LIGHT DETECTOR (ABSOLUTE HIGHEST PRIORITY) ──
+    # Runs at the top to clear the blindspot during police or chasing events
+    if front_frame is not None:
+        gray = cv2.cvtColor(front_frame, cv2.COLOR_BGR2GRAY)
+        average_brightness = np.mean(gray)
+        standard_deviation = np.std(gray) # Gathers pixel contrast variance metrics
+
+        # Genuine environmental darkness has low brightness AND low variance (entire screen dark).
+        # Yellow token camera corruption injects high-contrast glitch static (low brightness BUT high variance).
+        if average_brightness < 45.0:
+            if standard_deviation < 18.0: # True darkness ceiling constraint filter
+                darkness_consecutive_ticks += 1
+                if darkness_consecutive_ticks >= 12: 
+                    print(f"[CHALLENGE 1] Sustained Darkness confirmed! Brightness: {average_brightness:.2f}, Variance: {standard_deviation:.2f}. Recovering light...")
+                    tactical_checklist['darkness_passed'] = True
+                    with data_lock:
+                        shared_data['steering_input'] = 0.0
+                        shared_data['acceleration_input'] = -1.0 # Sends recovery pulse
+                    return
+            else:
+                # High contrast deviation signals a yellow camera glitch! Reject and bypass
+                darkness_consecutive_ticks = 0
+        else:
+            darkness_consecutive_ticks = 0
+
+    # Throttle holds modifier configurations
     if script_start_time is not None:
         elapsed_run_time = time.time() - script_start_time
         cooldown_multiplier = min(2.0, 1.0 + (elapsed_run_time / 90.0))
@@ -464,9 +473,7 @@ def processing_task():
 
     target_acceleration = 0.65 
 
-    # ==================================================================
-    # CHALLENGE 2: Chasing Car (HIGHEST PRIORITY)
-    # ==================================================================
+    # ── CHALLENGE 2: Chasing Car State Managment Loop ──
     if chasing_car_state['detection_cooldown'] > 0:
         chasing_car_state['detection_cooldown'] -= 1
     else:
@@ -474,17 +481,11 @@ def processing_task():
 
     if chasing_car_state['is_chasing_active']:
         chasing_car_state['evasion_ticks_remaining'] -= 1
-
         if chasing_car_state['evasion_ticks_remaining'] <= 0:
             print(f"[CHALLENGE 2] Evasion complete. Resuming tactical driving.")
             chasing_car_state['is_chasing_active'] = False
             chasing_car_state['detection_cooldown'] = CHASING_DETECTION_COOLDOWN 
-            
-            if chasing_car_state['appearances_count'] == 1:
-                tactical_checklist['chasing_a_passed'] = True
-            else:
-                tactical_checklist['chasing_b_passed'] = True
-                
+            tactical_checklist['chasing_a_passed' if chasing_car_state['appearances_count'] == 1 else 'chasing_b_passed'] = True
             with data_lock:
                 shared_data['steering_input'] = 0.0
             steering_cooldown = int(20 * cooldown_multiplier)  
@@ -495,13 +496,8 @@ def processing_task():
                 shared_data['acceleration_input'] = 1.0 
             return
 
-    if (chasing_car_state['appearances_count'] < 2
-            and chasing_car_state['detection_cooldown'] <= 0):
-
-        with data_lock:
-            back_frame = shared_data['latest_back_frame']
+    if chasing_car_state['appearances_count'] < 2 and chasing_car_state['detection_cooldown'] <= 0:
         prev_back = chasing_car_state['prev_back_frame']
-
         if back_frame is not None:
             car_detected = detect_chasing_car(back_frame, prev_back)
             chasing_car_state['prev_back_frame'] = back_frame.copy()
@@ -513,7 +509,6 @@ def processing_task():
                     chasing_car_state['is_chasing_active'] = True
                     chasing_car_state['consecutive_detections'] = 0
                     chasing_car_state['evasion_ticks_remaining'] = CHASING_EVASION_TICKS_1ST if chasing_car_state['appearances_count'] == 1 else CHASING_EVASION_TICKS_2ND
-
                     with data_lock:
                         shared_data['steering_input'] = -1.0
                         shared_data['acceleration_input'] = 1.0 
@@ -525,34 +520,21 @@ def processing_task():
     with data_lock:
         shared_data['trailing_car_detected'] = False
 
-    # ==================================================================
-    # 🌟 Proportional Golden Lane Sweeper (2nd HIGHEST PRIORITY)
-    # ==================================================================
+    # ── 🌟 Proportional Golden Lane Sweeper Execution Loop ──
     if golden_lane_state['detection_cooldown'] > 0:
         golden_lane_state['detection_cooldown'] -= 1
 
     if golden_lane_state['is_active']:
         golden_lane_state['event_ticks_remaining'] -= 1
-        
-        with data_lock: front_frame = shared_data['latest_front_frame']
-            
         if front_frame is not None:
             width = front_frame.shape[1]
             frame_center_x = width // 2
             
-            if golden_lane_state['target_lane'] == 1:
-                lane_target_x = int(width * 0.23)
-            elif golden_lane_state['target_lane'] == 3:
-                lane_target_x = int(width * 0.77)
-            else:
-                lane_target_x = int(width * 0.50)
+            lane_target_x = int(width * 0.23) if golden_lane_state['target_lane'] == 1 else (int(width * 0.77) if golden_lane_state['target_lane'] == 3 else int(width * 0.50))
                 
             hsv = cv2.cvtColor(front_frame, cv2.COLOR_BGR2HSV)
-            lower_green = np.array([50, 80, 100])
-            upper_green = np.array([75, 255, 255])
-            mask_green = cv2.inRange(hsv, lower_green, upper_green)
-            mask_green[0:int(front_frame.shape[0] * 0.30), :] = 0
-            mask_green[int(front_frame.shape[0] * 0.85):, :] = 0
+            mask_green = cv2.inRange(hsv, np.array([50, 80, 100]), np.array([75, 255, 255]))
+            mask_green[0:int(front_frame.shape[0] * 0.30), :] = 0; mask_green[int(front_frame.shape[0] * 0.85):, :] = 0
             
             contours_green, _ = cv2.findContours(mask_green, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
             target_x = lane_target_x
@@ -573,36 +555,29 @@ def processing_task():
             
             deviation = target_x - frame_center_x
             target_steering = np.clip(deviation / (width * 0.18), -1.0, 1.0)
-                
             with data_lock:
                 shared_data['steering_input'] = target_steering
                 shared_data['acceleration_input'] = 0.65 
                 
         if golden_lane_state['event_ticks_remaining'] <= 0:
-            print("[GOLDEN LANE] Window expired. Position locked.")
+            print("[GOLDEN LANE] Instruction tracking complete.")
             golden_lane_state['is_active'] = False
             tactical_checklist['golden_lane_passed'] = True
             golden_lane_state['detection_cooldown'] = GOLDEN_DETECTION_COOLDOWN
             steering_cooldown = 10
         return
 
-    # ==================================================================
-    # CHALLENGE 3: Police Car (3rd HIGHEST PRIORITY)
-    # ==================================================================
+    # ── CHALLENGE 3: Police Car Active Tracker Layer ──
     if police_car_state['detection_cooldown'] > 0:
         police_car_state['detection_cooldown'] -= 1
 
     if police_car_state['is_active']:
         police_car_state['event_ticks_remaining'] -= 1
-        with data_lock:
-            front_frame_for_police = shared_data['latest_front_frame']
 
-        if front_frame_for_police is not None:
-            body_box = _detect_police_body(front_frame_for_police)
-            token_found, token_cx, token_box = _find_red_token(front_frame_for_police)
-
-            frame_width = front_frame_for_police.shape[1]
-            frame_height = front_frame_for_police.shape[0]
+        if front_frame is not None:
+            body_box = _detect_police_body(front_frame)
+            token_found, token_cx, token_box = _find_red_token(front_frame)
+            frame_width, frame_height = front_frame.shape[1], front_frame.shape[0]
             frame_center_x = frame_width // 2
 
             target_steering = 0.0
@@ -611,16 +586,11 @@ def processing_task():
             collision_imminent = False
             if body_box is not None:
                 bx, by, bw, bh = body_box
-                body_cx = bx + bw // 2
-                body_bottom = by + bh
-
+                body_cx, body_bottom = bx + bw // 2, by + bh
                 if body_bottom > frame_height * POLICE_COLLISION_Y_RATIO:
                     collision_imminent = True
                     target_acceleration = 1.0 
-                    if body_cx >= frame_center_x:
-                        target_steering = -1.0  
-                    else:
-                        target_steering = 1.0   
+                    target_steering = -1.0 if body_cx >= frame_center_x else 1.0
 
             if not collision_imminent and token_found:
                 if abs(token_cx - frame_center_x) > POLICE_TOKEN_CENTER_TOL:
@@ -629,8 +599,7 @@ def processing_task():
                     target_steering = 0.0
 
                 tx, ty, tw, th = token_box
-                if (abs(token_cx - frame_center_x) < 40
-                        and (ty + th) > frame_height * POLICE_TOKEN_CAUGHT_Y_RATIO):
+                if abs(token_cx - frame_center_x) < 40 and (ty + th) > frame_height * POLICE_TOKEN_CAUGHT_Y_RATIO:
                     police_car_state['red_token_caught'] = True
 
             with data_lock:
@@ -647,34 +616,29 @@ def processing_task():
             steering_cooldown = int(20 * cooldown_multiplier)  
         return
 
-    # Check background frames for event hooks
-    with data_lock:
-        front_check_frame = shared_data['latest_front_frame']
-        
-    if front_check_frame is not None and golden_lane_state['detection_cooldown'] <= 0:
-        text_found, parsed_lane = _detect_golden_lane_text(front_check_frame)
-        if text_found:
-            print(f"[GOLDEN LANE] Instruction detected! Target Lane: {parsed_lane}. Executing tracking...")
-            golden_lane_state['is_active'] = True
-            golden_lane_state['target_lane'] = parsed_lane
-            golden_lane_state['event_ticks_remaining'] = GOLDEN_EVENT_DURATION_TICKS
-            return
-
-    if front_check_frame is not None and police_car_state['detection_cooldown'] <= 0:
-        lightbar_found, _ = _detect_police_lightbar(front_check_frame)
-
-        if lightbar_found:
-            police_car_state['consecutive_detections'] += 1
-            if police_car_state['consecutive_detections'] >= POLICE_DEBOUNCE_FRAMES:
-                police_car_state['is_active'] = True
-                police_car_state['event_ticks_remaining'] = POLICE_EVENT_DURATION_TICKS
-                police_car_state['red_token_caught'] = False
-                police_car_state['consecutive_detections'] = 0
+    # Background hooks verification triggers
+    if front_frame is not None:
+        if golden_lane_state['detection_cooldown'] <= 0:
+            text_found, parsed_lane = _detect_golden_lane_text(front_frame)
+            if text_found:
+                print(f"[GOLDEN LANE] Event initialization caught! Heading to Lane {parsed_lane}...")
+                golden_lane_state['is_active'] = True
+                golden_lane_state['target_lane'] = parsed_lane
+                golden_lane_state['event_ticks_remaining'] = GOLDEN_EVENT_DURATION_TICKS
                 return
 
-    # ==================================================================
-    # Passive Base Driving Layer
-    # ==================================================================
+        if police_car_state['detection_cooldown'] <= 0:
+            lightbar_found, _ = _detect_police_lightbar(front_frame)
+            if lightbar_found:
+                police_car_state['consecutive_detections'] += 1
+                if police_car_state['consecutive_detections'] >= POLICE_DEBOUNCE_FRAMES:
+                    police_car_state['is_active'] = True
+                    police_car_state['event_ticks_remaining'] = POLICE_EVENT_DURATION_TICKS
+                    police_car_state['red_token_caught'] = False
+                    police_car_state['consecutive_detections'] = 0
+                    return
+
+    # ── Passive Driving Layer ──
     if steering_cooldown > 0:
         steering_cooldown -= 1
         if steering_cooldown == 0:
@@ -682,83 +646,45 @@ def processing_task():
                 shared_data['steering_input'] = 0.0
         return
 
-    with data_lock:
-        front_frame = shared_data['latest_front_frame']
-
     if front_frame is not None:
-        gray = cv2.cvtColor(front_frame, cv2.COLOR_BGR2GRAY)
-        average_brightness = np.mean(gray)
-
-        if average_brightness < 45.0:
-            darkness_consecutive_ticks += 1
-            if darkness_consecutive_ticks >= 12: 
-                print(f"[CHALLENGE 1] Sustained Darkness confirmed! Brightness: {average_brightness:.2f}. Recovering light...")
-                tactical_checklist['darkness_passed'] = True
-                with data_lock:
-                    shared_data['steering_input'] = 0.0
-                    shared_data['acceleration_input'] = -1.0 
-                return
-        else:
-            darkness_consecutive_ticks = 0
-
         hsv = cv2.cvtColor(front_frame, cv2.COLOR_BGR2HSV)
         frame_center_x = front_frame.shape[1] // 2
-
         target_steering = 0.0
 
-        lower_red1 = np.array([0,   100, 100]) 
-        upper_red1 = np.array([8,   255, 255])
-        lower_red2 = np.array([172, 100, 100]) 
-        upper_red2 = np.array([179, 255, 255])
-        lower_green = np.array([50, 80, 100])  
-        upper_green = np.array([75, 255, 255])
-        lower_yellow = np.array([20, 100, 100]) 
-        upper_yellow = np.array([35, 255, 255])
-
-        mask_red1 = cv2.inRange(hsv, lower_red1, upper_red1)
-        mask_red2 = cv2.inRange(hsv, lower_red2, upper_red2)
+        mask_red1 = cv2.inRange(hsv, np.array([0, 100, 100]), np.array([8, 255, 255]))
+        mask_red2 = cv2.inRange(hsv, np.array([172, 100, 100]), np.array([179, 255, 255]))
         mask_red = cv2.bitwise_or(mask_red1, mask_red2)
-        mask_green = cv2.inRange(hsv, lower_green, upper_green)
-        mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
+        mask_green = cv2.inRange(hsv, np.array([50, 80, 100]), np.array([75, 255, 255]))
+        mask_yellow = cv2.inRange(hsv, np.array([20, 100, 100]), np.array([35, 255, 255]))
 
         height, width = mask_red.shape[:2]
-        mask_red[0:int(height * 0.30), :] = 0
-        mask_green[0:int(height * 0.30), :] = 0
-        mask_yellow[0:int(height * 0.30), :] = 0
-
-        mask_red[int(height * 0.85):, :] = 0
-        mask_green[int(height * 0.85):, :] = 0
-        mask_yellow[int(height * 0.85):, :] = 0
+        mask_red[0:int(height * 0.30), :] = 0; mask_green[0:int(height * 0.30), :] = 0; mask_yellow[0:int(height * 0.30), :] = 0
+        mask_red[int(height * 0.85):, :] = 0; mask_green[int(height * 0.85):, :] = 0; mask_yellow[int(height * 0.85):, :] = 0
 
         if not has_saved_debug:
             cv2.imwrite("debug_1_raw_frame.png", front_frame)
             cv2.imwrite("debug_2_red_mask.png", mask_red)
             cv2.imwrite("debug_3_green_mask.png", mask_green)
             cv2.imwrite("debug_4_yellow_mask.png", mask_yellow)
-            print("[DEBUG] Saved snapshots to folder!")
             has_saved_debug = True
 
         contours_red, _ = cv2.findContours(mask_red, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         contours_green, _ = cv2.findContours(mask_green, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         contours_yellow, _ = cv2.findContours(mask_yellow, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
-        # PRIORITY 1: Dodge Red Tokens
         if contours_red:
             largest_red = max(contours_red, key=cv2.contourArea)
             if cv2.contourArea(largest_red) > 400:
                 x, y, w, h = cv2.boundingRect(largest_red)
                 red_center_x = x + w // 2
-
                 if abs(red_center_x - frame_center_x) < 100:
                     target_steering = -1.0 if red_center_x > frame_center_x else 1.0
-                    steering_cooldown = int(15 * cooldown_multiplier) 
-
+                    steering_cooldown = int(15 * cooldown_multiplier)
                     with data_lock:
                         shared_data['steering_input'] = target_steering
                         shared_data['acceleration_input'] = target_acceleration
                     return
 
-        # PRIORITY 2: Dodge Yellow Tokens
         danger_yellows = []
         for c in contours_yellow:
             area = cv2.contourArea(c)
@@ -770,17 +696,14 @@ def processing_task():
             danger_yellows.sort(key=lambda t: t[5], reverse=True)
             area, x, y, w, h, token_bottom = danger_yellows[0]
             yellow_center_x = x + w // 2
-
             if abs(yellow_center_x - frame_center_x) < 130:
                 target_steering = -1.0 if yellow_center_x >= frame_center_x else 1.0
-                steering_cooldown = int(8 * cooldown_multiplier) 
-                print(f"[YELLOW] Dodging yellow token at x={yellow_center_x}, steering={target_steering}")
+                steering_cooldown = int(8 * cooldown_multiplier)
                 with data_lock:
                     shared_data['steering_input'] = target_steering
                     shared_data['acceleration_input'] = target_acceleration
                 return
 
-        # PRIORITY 3: Proportional Green Token Harvesting
         if contours_green:
             valid_greens = []
             for c in contours_green:
@@ -808,17 +731,13 @@ def processing_task():
 
 def send_controls_task():
     global control_conn
-    if control_conn is None:
-        return
-
+    if control_conn is None: return
     with data_lock:
-        steering_input = shared_data['steering_input']
-        acceleration_input = shared_data['acceleration_input']
-
+        s = shared_data['steering_input']
+        a = shared_data['acceleration_input']
     try:
-        data = struct.pack('ff', steering_input, acceleration_input)
-        control_conn.sendall(data)
-    except Exception as e:
+        control_conn.sendall(struct.pack('ff', s, a))
+    except Exception:
         control_conn = None
 
 # ---------------------------------------------------------
@@ -828,7 +747,6 @@ if __name__ == '__main__':
     print("Initializing RTSE Sample Drive...")
     script_start_time = time.time()
 
-    # Only track and load the rear perspective window module directly
     window_back = "Back Camera Feed (Rear View)"
     back_window_created = False
 
@@ -842,10 +760,7 @@ if __name__ == '__main__':
     t_processing = RTTask("Processing", period=0.01, priority=TaskPriority.MEDIUM, execute_func=processing_task)
     t_controls = RTTask("SendControls", period=0.005, priority=TaskPriority.HIGH, execute_func=send_controls_task)
 
-    t_front_camera.start()
-    t_back_camera.start()
-    t_processing.start()
-    t_controls.start()
+    t_front_camera.start(); t_back_camera.start(); t_processing.start(); t_controls.start()
 
     try:
         while is_running:
@@ -853,7 +768,6 @@ if __name__ == '__main__':
                 back_frame = shared_data['latest_back_frame']
                 trailing_detected = shared_data['trailing_car_detected']
 
-            # Render and handle the Back View window layout frame exclusively
             if back_frame is not None:
                 if not back_window_created:
                     cv2.namedWindow(window_back, cv2.WINDOW_NORMAL)
@@ -861,20 +775,16 @@ if __name__ == '__main__':
                     back_window_created = True
 
                 back_display = back_frame.copy()
-                
-                # Overlay vital rear status data metrics onto canvas interface layer
                 if trailing_detected or chasing_car_state['is_chasing_active']:
                     h, w = back_display.shape[:2]
                     cv2.rectangle(back_display, (0, 0), (w-1, h-1), (0, 0, 255), 4)
-                    cv2.putText(back_display, "!! PURSUIT THREAT !!", (15, 35), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                    cv2.putText(back_display, "!! PURSUIT THREAT !!", (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
                 
                 if police_car_state['is_active']:
                     h, w = back_display.shape[:2]
                     cv2.rectangle(back_display, (0, 0), (w-1, h-1), (0, 140, 255), 4)
 
-                back_resized = cv2.resize(back_display, (640, 480))
-                cv2.imshow(window_back, back_resized)
+                cv2.imshow(window_back, cv2.resize(back_display, (640, 480)))
 
             if cv2.waitKey(30) & 0xFF == 27: 
                 break
@@ -882,16 +792,9 @@ if __name__ == '__main__':
         is_running = False
 
     is_running = False
-    t_front_camera.join()
-    t_back_camera.join()
-    t_processing.join()
-    t_controls.join()
-
-    if front_camera_sock:
-        front_camera_sock.close()
-    if back_camera_sock:
-        back_camera_sock.close()
-    if control_conn:
-        control_conn.close()
+    t_front_camera.join(); t_back_camera.join(); t_processing.join(); t_controls.join()
+    if front_camera_sock: front_camera_sock.close()
+    if back_camera_sock: back_camera_sock.close()
+    if control_conn: control_conn.close()
     cv2.destroyAllWindows()
     print("System terminated cleanly.")
