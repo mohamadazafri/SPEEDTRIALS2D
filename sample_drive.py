@@ -373,12 +373,16 @@ def _find_red_token(frame):
     height, width = frame.shape[:2]
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    lower_red1, upper_red1 = np.array([0, 100, 100]), np.array([8, 255, 255])
-    lower_red2, upper_red2 = np.array([172, 100, 100]), np.array([179, 255, 255])
+    lower_red1, upper_red1 = np.array([0, 70, 50]), np.array([10, 255, 255])
+    lower_red2, upper_red2 = np.array([170, 70, 50]), np.array([180, 255, 255])
     mask_red = cv2.bitwise_or(cv2.inRange(hsv, lower_red1, upper_red1), cv2.inRange(hsv, lower_red2, upper_red2))
 
     mask_red[0:int(height * 0.30), :] = 0
     mask_red[int(height * 0.85):, :] = 0
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel)
+    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel)
 
     contours, _ = cv2.findContours(mask_red, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -533,11 +537,16 @@ def processing_task():
             
             # Use HSV to isolate all green tokens
             hsv = cv2.cvtColor(front_frame, cv2.COLOR_BGR2HSV)
-            mask_green = cv2.inRange(hsv, np.array([40, 80, 100]), np.array([80, 255, 255]))
+            mask_green = cv2.inRange(hsv, np.array([40, 50, 50]), np.array([85, 255, 255]))
             
             # Mask out the sky and the immediate hood to focus on the road
             mask_green[0:int(height * 0.30), :] = 0 
             mask_green[int(height * 0.85):, :] = 0
+            
+            # Apply morphological operations to reduce noise and improve detection
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+            mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_CLOSE, kernel)
+            mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, kernel)
             
             contours_green, _ = cv2.findContours(mask_green, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
             
@@ -656,15 +665,27 @@ def processing_task():
         frame_center_x = front_frame.shape[1] // 2
         target_steering = 0.0
 
-        mask_red1 = cv2.inRange(hsv, np.array([0, 100, 100]), np.array([8, 255, 255]))
-        mask_red2 = cv2.inRange(hsv, np.array([172, 100, 100]), np.array([179, 255, 255]))
+        mask_red1 = cv2.inRange(hsv, np.array([0, 70, 50]), np.array([10, 255, 255]))
+        mask_red2 = cv2.inRange(hsv, np.array([170, 70, 50]), np.array([180, 255, 255]))
         mask_red = cv2.bitwise_or(mask_red1, mask_red2)
-        mask_green = cv2.inRange(hsv, np.array([50, 80, 100]), np.array([75, 255, 255]))
-        mask_yellow = cv2.inRange(hsv, np.array([20, 100, 100]), np.array([35, 255, 255]))
+        mask_green = cv2.inRange(hsv, np.array([40, 50, 50]), np.array([85, 255, 255]))
+        mask_yellow = cv2.inRange(hsv, np.array([20, 70, 50]), np.array([35, 255, 255]))
 
         height, width = mask_red.shape[:2]
         mask_red[0:int(height * 0.30), :] = 0; mask_green[0:int(height * 0.30), :] = 0; mask_yellow[0:int(height * 0.30), :] = 0
         mask_red[int(height * 0.85):, :] = 0; mask_green[int(height * 0.85):, :] = 0; mask_yellow[int(height * 0.85):, :] = 0
+
+        # Apply morphological operations to improve detection robustness for all tokens
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        
+        mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel)
+        mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel)
+        
+        mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_CLOSE, kernel)
+        mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, kernel)
+        
+        mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_CLOSE, kernel)
+        mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_OPEN, kernel)
 
         if not has_saved_debug:
             cv2.imwrite("debug_1_raw_frame.png", front_frame)
