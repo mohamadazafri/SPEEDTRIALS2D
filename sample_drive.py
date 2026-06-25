@@ -47,7 +47,7 @@ tactical_checklist = {
 }
 
 # ==================================================================
-# CHALLENGE 2: Chasing Car — Global State Machine Array (FIXED)
+# CHALLENGE 2: Chasing Car — Global State Machine Array
 # ==================================================================
 chasing_car_state = {
     'prev_back_frame':          None,  # Previous back frame for differencing
@@ -73,7 +73,7 @@ police_car_state = {
     'is_active':              False,  
     'event_ticks_remaining':  0,      
     'red_token_caught':       False,  
-    'detection_cooldown':       0,      
+    'detection_cooldown':     0,      
     'consecutive_detections': 0,      
 }
 POLICE_DEBOUNCE_FRAMES      = 3     
@@ -526,41 +526,46 @@ def processing_task():
 
     if golden_lane_state['is_active']:
         golden_lane_state['event_ticks_remaining'] -= 1
+        
         if front_frame is not None:
-            width = front_frame.shape[1]
+            height, width = front_frame.shape[:2]
             frame_center_x = width // 2
             
-            lane_target_x = int(width * 0.23) if golden_lane_state['target_lane'] == 1 else (int(width * 0.77) if golden_lane_state['target_lane'] == 3 else int(width * 0.50))
-                
+            # Use HSV to isolate all green tokens
             hsv = cv2.cvtColor(front_frame, cv2.COLOR_BGR2HSV)
-            mask_green = cv2.inRange(hsv, np.array([50, 80, 100]), np.array([75, 255, 255]))
-            mask_green[0:int(front_frame.shape[0] * 0.30), :] = 0; mask_green[int(front_frame.shape[0] * 0.85):, :] = 0
+            mask_green = cv2.inRange(hsv, np.array([40, 80, 100]), np.array([80, 255, 255]))
+            
+            # Mask out the sky and the immediate hood to focus on the road
+            mask_green[0:int(height * 0.30), :] = 0 
+            mask_green[int(height * 0.85):, :] = 0
             
             contours_green, _ = cv2.findContours(mask_green, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-            target_x = lane_target_x
+            
+            target_steering = 0.0
             
             if contours_green:
-                lane_greens = []
-                for c in contours_green:
-                    if cv2.contourArea(c) > 80:
-                        gx, gy, gw, gh = cv2.boundingRect(c)
-                        g_cx = gx + gw // 2
-                        if (golden_lane_state['target_lane'] == 1 and g_cx < width * 0.4) or \
-                           (golden_lane_state['target_lane'] == 3 and g_cx > width * 0.6) or \
-                           (golden_lane_state['target_lane'] == 2 and width * 0.4 <= g_cx <= width * 0.6):
-                            lane_greens.append((gy + gh, g_cx))
-                if lane_greens:
-                    lane_greens.sort(key=lambda t: t[0], reverse=True) 
-                    target_x = lane_greens[0][1]
-            
-            deviation = target_x - frame_center_x
-            target_steering = np.clip(deviation / (width * 0.18), -1.0, 1.0)
+                # Filter for valid tokens and find the largest one (closest to the car)
+                valid_greens = [c for c in contours_green if cv2.contourArea(c) > 80]
+                if valid_greens:
+                    largest_green = max(valid_greens, key=cv2.contourArea)
+                    gx, gy, gw, gh = cv2.boundingRect(largest_green)
+                    green_center_x = gx + gw // 2
+                    
+                    # Proportional control to center the car on the green token streak
+                    deviation = green_center_x - frame_center_x
+                    
+                    # Apply a small deadzone (15 pixels) to prevent steering jitter once aligned
+                    if abs(deviation) > 15:
+                        target_steering = np.clip(deviation / (width * 0.25), -1.0, 1.0)
+
             with data_lock:
                 shared_data['steering_input'] = target_steering
-                shared_data['acceleration_input'] = 0.65 
+                # Boost speed to capitalize on the guaranteed +10% green token speed bonuses
+                shared_data['acceleration_input'] = 0.85 
                 
+        # Win condition check: 5 seconds (500 ticks at 100Hz) elapsed
         if golden_lane_state['event_ticks_remaining'] <= 0:
-            print("[GOLDEN LANE] Instruction tracking complete.")
+            print("[GOLDEN LANE] Event survived. Target lane secured.")
             golden_lane_state['is_active'] = False
             tactical_checklist['golden_lane_passed'] = True
             golden_lane_state['detection_cooldown'] = GOLDEN_DETECTION_COOLDOWN
